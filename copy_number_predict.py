@@ -43,6 +43,34 @@ def read_file(file_name):
     df.reset_index(drop = True, inplace = True)
     return(df)
 
+def read_models(file):
+    models_dict = dict()
+    labels_dict = dict()
+    with open(file,'r') as f:
+        lines = f.readlines()
+    lines = (l for l in lines)
+    n_comp, covar_type, input_order, means, startprob, covars, transmat = None, None, None, None, None, None, None
+    while True:
+        try:
+            l = next(lines)
+        except:
+            break
+        model_name = l.strip()
+        model_params = literal_eval(next(lines))
+        model = parse_model(model_params)
+        model_labels = model_params['Labels']
+        models_dict.update({model_name: model})
+        labels_dict.update({model_name: model_labels})
+    return(models_dict,labels_dict)
+
+def parse_model(model_params_dict):
+    model = hmm.GaussianHMM(n_components=model_params_dict['Model components'],covariance_type=model_params_dict['Covariance type'])
+    model.means_ = model_params_dict['means']
+    model.startprob_ = model_params_dict['startprob']
+    model.covars_ = model_params_dict['covars']
+    model.transmat_ = model_params_dict['transmat']
+    return(model)
+
 def filter_and_sort(df, gc_thresh = 0.15):
     # GC score filter
     df_filt = df.copy()[df['GC Score'] >= gc_thresh]
@@ -80,7 +108,7 @@ def filter_chrom(df,intervals):
 
 def seg_dup_filter(df,seg_dup_dict):
     new_df = pd.DataFrame()
-    for chrom,c_df in df.groupby('Chr'):
+    for chrom,c_df in df.groupby('Chr',observed = False):
         chrom_intervals = seg_dup_dict[chrom].copy()
         new_c_df = c_df[filter_chrom(c_df,chrom_intervals)]
         new_df = pd.concat([new_df,new_c_df],ignore_index=True)
@@ -124,7 +152,7 @@ def find_singlet(l,max_dist = 0.3):
 
 def baf_denoise(df,chr_col = 'Chr',pos_col = 'Position', baf_col = 'B Allele Freq', window_size = 1_000_000):
     out_df = pd.DataFrame()
-    for c_name,c_df in df.groupby(chr_col):
+    for c_name,c_df in df.groupby(chr_col,observed = False):
         if len(c_df) == 0:
             continue
         c_df.reset_index(inplace = True, drop = True)
@@ -159,7 +187,7 @@ def baf_denoise(df,chr_col = 'Chr',pos_col = 'Position', baf_col = 'B Allele Fre
 
 # BAF transformation functions
 def transform_BAF(df,chr_col = 'Chr',pos_col = 'Position', baf_col = 'B Allele Freq', dist_limit = 100_000):
-    pos_vals = list(df[[chr_col,pos_col]].apply(lambda x: pos_transform(x[0],x[1]) ,axis=1))
+    pos_vals = list(df[[chr_col,pos_col]].apply(lambda x: pos_transform(x.iloc[0],x.iloc[1]) ,axis=1))
     baf_vals = list(df[baf_col])
     values_dict = dict(enumerate(zip(pos_vals,baf_vals)))
     left_bound, current_index, right_bound = 0,0,0
@@ -397,7 +425,7 @@ def CN_call_cleanup(df,dist_limit = 100_000):
                 output_list = output_list + [next_vals[0][3]] * len(current_vals)
             continue
         elif current_cn == '0x' and len(current_vals) >= 5:
-            output_list.append([x[0] for x in current_vals])
+            output_list = output_list + [x[0] for x in current_vals]
             continue
         # dealing with short calls
         if (len(current_vals) < 5 or len(list(set([x[2] for x in current_vals]))) < 3) :
@@ -603,12 +631,11 @@ def summary_table(df, X_cn, minimum_probes = 10, lrr_2x_mean = 0, lrr_2x_var = 0
 help_msg = '''usage: python copy_number_predict.py -f <file.txt[.gz]> -o <output.txt> [options]
 Mandatory arguments:
     -f: input file
+    -m: file with model parameters
     -o: output file (name stem only)
     
 Options:
     -i: ISCN value from metadata
-    -l: Log R Ratio model, has a default
-    -b: B Allele Freq model, has a default
     -c: Chromosome, default to 'all'
     -d: Segmental duplication table
     -p: Plot prediction and save as file
@@ -618,10 +645,12 @@ Options:
     --min_probes: minimum number of probes for an abnormal region to include in the summary table, default 10
 '''
 
+
+# Re-work the model reading part
 def main():
     time_format = '%Y-%m-%d %H:%M:%S'
     arg_list = sys.argv[1:]
-    short_opts = 'f:o:l:b:c:i:d:pgh'
+    short_opts = 'f:o:m:c:i:d:pgh'
     long_opts = ['help','include_XY_homology','min_probes=']
     try:
         opt_list = getopt.getopt(arg_list, short_opts, long_opts)[0]
@@ -633,7 +662,7 @@ def main():
     
     file_name, save_name, plot_name, iscn = None, None, None, None
     segmental_dup_table = 'segmental_duplication_hg19.txt'
-    lrr_model_file, baf_model_file = 'lrr_5_states_hmm_w_labels.pkl','baf_3_states_hmm_w_labels.pkl'
+    model_file = None
     target_chrom = 'all'
     excl_XY_hom, gz, make_plot = True, False, False
     min_probes = 10
@@ -649,10 +678,8 @@ def main():
         elif current_arg == '-c':
             target_chrom = current_val
             print(f'{datetime.strftime(datetime.now(),time_format)}\tProcess only chromosome {target_chrom}')
-        elif current_arg == '-l':
-            lrr_model_file = current_val
-        elif current_arg == '-b':
-            baf_model_file = current_val
+        elif current_arg == '-m':
+            model_file = current_val
         elif current_arg == '-i':
             iscn = current_val
         elif current_arg == '-d':
@@ -690,10 +717,12 @@ def main():
     log_file.write(f'{datetime.strftime(datetime.now(),time_format)}\tInput file: {os.path.abspath(file_name)}\n')
     log_file.write(f'{datetime.strftime(datetime.now(),time_format)}\tTarget chromosome(s): {target_chrom}\n')
     
-    with open('baf_3_states_hmm_w_labels.pkl','rb') as f: 
-        baf_model, baf_model_labels = pickle.load(f)
-    with open('lrr_5_states_hmm_w_labels.pkl','rb') as f: 
-        lrr_model, lrr_model_labels = pickle.load(f)
+    models, labels = read_models(model_file)
+    lrr_model = models['lrr_model']
+    lrr_model_labels = labels['lrr_model']
+    baf_model = models['baf_model']
+    baf_model_labels = labels['baf_model']
+    
     pd.set_option('display.float_format', lambda x: '%.7f' % x)
     
     # Processing steps
@@ -731,11 +760,11 @@ def main():
         log_file.write(f'{datetime.strftime(datetime.now(),time_format)}\tRemoving XY homology probes..\n')
         trans_df = trans_df[trans_df['XY Homology'] == False].copy()
         trans_df.reset_index(inplace = True, drop = True)
-        trans_df = transform_BAF(trans_df)
     print(f'{datetime.strftime(datetime.now(),time_format)}\tRemoving probes in segmental duplications..')
     log_file.write(f'{datetime.strftime(datetime.now(),time_format)}\tRemoving probes in segmental duplications..\n')
     dups = dup_intervals(segmental_dup_table)
     trans_df = seg_dup_filter(trans_df,dups)
+    trans_df = transform_BAF(trans_df)
     
     #6. Prediction by BAF and LRR and joint interpretation, followed by low confidence filter
     print(f'{datetime.strftime(datetime.now(),time_format)}\tPredicting CN by BAF and LRR..')
@@ -801,6 +830,7 @@ def main():
         f.write(f'## Transmat={baf_model.transmat_.tolist()}\n')
         f.write(f'## Start_prob={baf_model.startprob_.tolist()}\n')
     sum_df = summary_table(output_df, X_ploidy, minimum_probes = min_probes)
+    sum_df = sum_df[sum_df['FDR'] < 0.05]
     sum_df.to_csv(summary_out_name,mode = 'a',sep = '\t',index = False)
     
     if make_plot:
@@ -825,6 +855,7 @@ if __name__ == '__main__':
     from matplotlib import pyplot as plt
     from itertools import cycle,islice,groupby
     from datetime import datetime
+    from ast import literal_eval
     main()
     
     
